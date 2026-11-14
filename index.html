@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Guard — BSC token risk screener</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; }
+  input { width: 100%; padding: .6rem; font-size: 1rem; box-sizing: border-box; }
+  button { margin-top: .6rem; padding: .6rem 1.2rem; font-size: 1rem; cursor: pointer; }
+  #out { margin-top: 1.2rem; white-space: pre-wrap; background: #f4f4f4; padding: 1rem; border-radius: 8px; }
+  .low { color: #0a7a2f; } .med { color: #b26a00; } .high { color: #c00; }
+  small { color: #666; }
+</style>
+</head>
+<body>
+<h1>🛡️ Token Guard</h1>
+<p>Screen a BSC token contract <b>before</b> you interact with it. Score 0–100, verdict, and reasons — from public data only (Dexscreener + BSC RPC). Nothing is signed or sent. <small>zkVerify Agent Games — Wildcard entry by @alive199.</small></p>
+<input id="addr" placeholder="0x... BSC contract address" value="0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c">
+<br><button id="go">Check token</button>
+<button id="amnc">Try AMNC (unlisted)</button>
+<div id="out">Paste a contract address and press Check token.</div>
+<p><small>First-pass screener, not financial advice. Always verify the contract yourself. Server version (Python, stdlib only): <code>guard.py</code> in this repo — same scoring logic, <code>POST /check</code>.</small></p>
+<script>
+const RPCS = [
+  "https://bsc-dataseed2.defibit.io/",
+  "https://bsc-dataseed1.binance.org/",
+  "https://bsc.publicnode.com/",
+];
+const ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
+
+async function rpcGetCode(address) {
+  let lastErr = null;
+  for (const url of RPCS) {
+    try {
+      const r = await fetch(url, { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getCode", params: [address, "latest"] }) });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return (await r.json()).result;
+    } catch (e) { lastErr = e; }
+  }
+  throw new Error("all BSC RPC endpoints failed (" + lastErr + ")");
+}
+
+async function checkToken(address) {
+  const reasons = [];
+  let score = 100;
+  let hasCode = null;
+  try {
+    const code = await rpcGetCode(address);
+    hasCode = code && code !== "0x" && code !== "0x0";
+  } catch (e) {
+    reasons.push("Could not reach BSC RPC to verify contract code (" + e.message + ").");
+    score -= 10;
+  }
+  if (hasCode === false) {
+    reasons.push("No contract code at this address on BSC — it is not a token contract.");
+    score -= 60;
+  }
+  let pairs = [];
+  try {
+    const r = await fetch("https://api.dexscreener.com/tokens/v1/bsc/" + address);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    pairs = (await r.json()) || [];
+  } catch (e) {
+    reasons.push("Dexscreener lookup failed (" + e.message + "); market data unknown.");
+    score -= 10;
+  }
+  if (!pairs.length) {
+    reasons.push("No trading pair found on Dexscreener — token may be unlisted or untradeable.");
+    score -= 40;
+  } else {
+    const best = pairs.reduce((a, b) => ((b.liquidity?.usd || 0) > (a.liquidity?.usd || 0) ? b : a));
+    const liq = best.liquidity?.usd || 0;
+    const vol24 = best.volume?.h24 || 0;
+    const buys = best.txns?.h24?.buys || 0;
+    const sells = best.txns?.h24?.sells || 0;
+    const change24 = best.priceChange?.h24;
+    if (liq < 1000) { reasons.push(`Very low liquidity ($${liq.toLocaleString()}) — easy to manipulate, hard to exit.`); score -= 25; }
+    else if (liq < 10000) { reasons.push(`Low liquidity ($${liq.toLocaleString()}).`); score -= 10; }
+    if (buys + sells === 0) { reasons.push("Zero trades in the last 24h — market looks dead."); score -= 15; }
+    if (change24 != null && change24 <= -90) { reasons.push(`Price down ${change24.toFixed(0)}% in 24h.`); score -= 15; }
+    if (sells && buys === 0) { reasons.push("Only sells in the last 24h, no buys — possible one-way exit."); score -= 15; }
+  }
+  score = Math.max(0, Math.min(100, score));
+  const verdict = score >= 75 ? "LOW RISK" : score >= 45 ? "MEDIUM RISK" : "HIGH RISK";
+  return { address, score, verdict, reasons, pairs_found: pairs.length,
+    disclaimer: "First-pass screener, not financial advice. Always verify the contract yourself." };
+}
+
+const out = document.getElementById("out");
+async function run(address) {
+  address = address.trim();
+  if (!ADDR_RE.test(address)) { out.textContent = "Address must be a 0x-prefixed 40-hex BSC address."; return; }
+  out.textContent = "Checking " + address + " …";
+  try {
+    const res = await checkToken(address);
+    const cls = res.score >= 75 ? "low" : res.score >= 45 ? "med" : "high";
+    out.innerHTML = `<b>Score: ${res.score}/100 — <span class="${cls}">${res.verdict}</span></b>\n` +
+      `Pairs found: ${res.pairs_found}\n` +
+      (res.reasons.length ? res.reasons.map(r => "• " + r).join("\n") : "• No red flags found.") +
+      `\n\n${res.disclaimer}`;
+  } catch (e) {
+    out.textContent = "Check failed: " + e.message;
+  }
+}
+document.getElementById("go").onclick = () => run(document.getElementById("addr").value);
+document.getElementById("amnc").onclick = () => {
+  document.getElementById("addr").value = "0x04efC2D45f9D6b06f3A517218F164d473f74CAdD";
+  run(document.getElementById("addr").value);
+};
+</script>
+</body>
+</html>
